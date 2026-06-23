@@ -13,11 +13,19 @@ export default function CallSttSimulator({ onKeywordDetected }: CallSttSimulator
   const [interimTranscript, setInterimTranscript] = useState('');
   const [error, setError] = useState<string | null>(null);
   
-  // SpeechRecognition 객체를 유지하기 위한 ref
   const recognitionRef = useRef<any>(null);
+  // 마이크 하드웨어 자원을 완전히 닫아주기 위한 스트림 레퍼런스
+  const streamRef = useRef<MediaStream | null>(null);
+
+  // 마이크 하드웨어 트랙 자원을 안전하게 해제하는 헬퍼 함수
+  const releaseMicrophone = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+  };
 
   useEffect(() => {
-    // 브라우저 지원 여부 확인 (Chrome, Edge, Safari 등 지원)
     const SpeechRecognition =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
@@ -27,11 +35,8 @@ export default function CallSttSimulator({ onKeywordDetected }: CallSttSimulator
     }
 
     const recognition = new SpeechRecognition();
-    // true 설정 시 음성 인식이 끊기지 않고 계속 수신됨 (통화 모니터링 필수 옵션)
     recognition.continuous = true;
-    // 실시간으로 변환 중인 중간 결과도 수신 (중간 매칭 속도 향상)
     recognition.interimResults = true;
-    // 한국어 설정
     recognition.lang = 'ko-KR';
 
     recognition.onresult = (event: any) => {
@@ -46,28 +51,44 @@ export default function CallSttSimulator({ onKeywordDetected }: CallSttSimulator
         }
       }
 
-      // 확정된 텍스트가 나오면 누적 기록
       if (finalResult) {
         setTranscript((prev) => prev + ' ' + finalResult);
-        // 부모 컴포넌트에 확정 텍스트를 전달하여 피싱 키워드가 있는지 검사
         onKeywordDetected(finalResult);
       }
-      
-      // 현재 말하고 있는 도중의 임시 텍스트 상태 업데이트
       setInterimTranscript(interimResult);
     };
 
+    // 💡 권한 거부 및 시스템 오버레이 예외 처리 세분화
     recognition.onerror = (event: any) => {
       console.error('STT 에러 발생:', event.error);
-      if (event.error === 'not-allowed') {
-        setError('마이크 권한이 거부되었습니다. 통화 음성 수신을 위해 마이크를 허용해주세요.');
+      setIsCalling(false);
+      releaseMicrophone();
+
+      switch (event.error) {
+        case 'not-allowed':
+        case 'permission-denied':
+          setError('❌ 마이크 권한이 거부되었습니다. 주소창 왼쪽 설정(자물쇠)에서 마이크를 [허용]으로 변경 후 새로고침 해주세요.');
+          break;
+        case 'audio-capture':
+          setError('⚠️ 시스템 오류: 다른 앱(통화, 녹음기)이나 블루라이트 필터/화면 오버레이 앱이 마이크를 독점하고 있습니다. 해당 앱들을 닫고 다시 시도해 주세요.');
+          break;
+        case 'no-speech':
+          // 대화가 잠시 멈췄을 때 발생하는 일시적 경고이므로 상태를 완전히 끄지 않습니다.
+          console.log('음성이 감지되지 않음');
+          break;
+        default:
+          setError(`❌ 음성 인식 자원 오류 (${event.error}). 다시 시도해 주세요.`);
       }
     };
 
     recognition.onend = () => {
-      // 통화 중인데 엔진이 불의의 이유로 꺼졌다면 재시작
+      // 비정상적인 스트림 단절 시 재기동 처리부 (사용자가 직접 종료하지 않은 경우)
       if (isCalling) {
-        recognition.start();
+        try {
+          recognition.start();
+        } catch (e) {
+          console.error('STT 재시작 실패:', e);
+        }
       }
     };
 
@@ -77,27 +98,63 @@ export default function CallSttSimulator({ onKeywordDetected }: CallSttSimulator
       if (recognitionRef.current) {
         recognitionRef.current.stop();
       }
+      releaseMicrophone();
     };
   }, [isCalling]);
 
-  // 가상 통화 시작 (가상으로 수신 음성 가로채기 시작)
-  const startCallSimulation = () => {
+  // 가상 통화 시작 (권한 체크 및 선점)
+  const startCallSimulation = async () => {
     setError(null);
     setTranscript('');
     setInterimTranscript('');
-    setIsCalling(true);
     
     try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('NOT_SUPPORTED');
+      }
+
+      // 💡 브라우저 하드웨어 수준에서 먼저 오디오 세션을 요청하여 권한 및 충돌 상태를 검증
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true, // 하울링/에코 제어
+          noiseSuppression: true  // 노이즈 필터링
+        }
+      });
+      
+      streamRef.current = stream;
+      setIsCalling(true);
+      
+      // 검증이 완료된 직후 STT 엔진 연동 구동
       recognitionRef.current?.start();
-    } catch (e) {
-      console.error(e);
+    } catch (e: any) {
+      console.error('하드웨어 미디어 접근 실패:', e);
+      setIsCalling(false);
+      releaseMicrophone();
+
+      if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+        setError('❌ 마이크 권한이 거부되었습니다. 브라우저 설정에서 마이크를 허용해 주세요.');
+      } else if (e.name === 'NotReadableError' || e.name === 'TrackStartError') {
+        setError('⚠️ 시스템 오류: 다른 앱이나 투명 오버레이를 닫은 후 다시 시도해 보십시오.');
+      } else if (e.message === 'NOT_SUPPORTED') {
+        setError('❌ 보안 컨텍스트 오류: 보안 연결(HTTPS) 또는 localhost 환경이 아닙니다.');
+      } else {
+        setError('❌ 마이크 하드웨어를 시작할 수 없습니다.');
+      }
     }
   };
 
   // 가상 통화 종료
   const stopCallSimulation = () => {
     setIsCalling(false);
-    recognitionRef.current?.stop();
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch (e) {
+        console.error(e);
+      }
+    }
+    // 💡 사용한 마이크 오디오 채널 자원을 즉각 운영체제에 완벽히 반환
+    releaseMicrophone();
   };
 
   return (
@@ -145,9 +202,7 @@ export default function CallSttSimulator({ onKeywordDetected }: CallSttSimulator
           </p>
         )}
         
-        {/* 누적된 확정 문구 */}
         <span className="text-slate-100">{transcript}</span>
-        {/* 현재 인식 중인 미확정 문구 (흐리게 표시) */}
         <span className="text-slate-400 font-medium"> {interimTranscript}</span>
       </div>
     </div>
